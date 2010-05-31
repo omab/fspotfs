@@ -158,8 +158,9 @@ class FSpotFS(fuse.Fuse):
         result = set([str(tag[0]) for tag in self.query(SUBTAG_IDS % parent)])
         # second-level subtags and deeper
         next_level = set(reduce(lambda l1, l2: l1 + l2,
-                                [self.tag_childs(tid) for tid in result]))
-        return list(result + next_level)
+                                [self.tag_childs(tid) for tid in result],
+                                []))
+        return list(result) + list(next_level)
 
     @cls_cached('tag_names')
     def tag_names(self, parent=None):
