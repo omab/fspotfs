@@ -1,0 +1,15 @@
+F-Stop FUSE filesystem with readonly access only at the moment.
+Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
+
+1. Dependencies
+    * F-Spot of course, but it's photos database actually (http://f-spot.org)
+    * Python FUSE (http://pypi.python.org/pypi/fuse-python/)
+
+1. Run
+    It lacks of installation instructions at the moment, so do a cd to the
+    project copy and run from there:
+
+    $ ./fsfs --mount <mount directory>
+
+    For some details:
+    $ ./fsfs --help
