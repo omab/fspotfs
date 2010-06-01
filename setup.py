@@ -18,7 +18,7 @@ setup_args = {
 
 try:
     from setuptools import setup
-    setup_args['install_requires'] = ['fuse-python>=0.2', 'sqlite3>=2.4.1']
+    setup_args['install_requires'] = ['fuse-python>=0.2']
 except ImportError:
     from distutils.core import setup
 
