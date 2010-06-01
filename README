@@ -1,15 +1,27 @@
-F-Stop FUSE filesystem with readonly access only at the moment.
+F-Spot FUSE filesystem with read only access only at the moment.
 Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
 
-1. Dependencies
+
+1. Description
+    F-Spot FS implements a FUSE filesystem (http://fuse.sourceforge.net/) which
+    access F-Spot database to build a directory hierarchy of tag, sub-tags and
+    tagged photos. This way it's easy to traverse the photo collection while
+    keeping it organized in it's original format (by date, etc.).
+
+    Images are soft links to original files.
+
+
+2. Dependencies
     * F-Spot of course, but it's photos database actually (http://f-spot.org)
+      with schema version at least 17
     * Python FUSE (http://pypi.python.org/pypi/fuse-python/)
+    * Python SQLite (http://docs.python.org/library/sqlite3.html)
 
-1. Run
-    It lacks of installation instructions at the moment, so do a cd to the
-    project copy and run from there:
 
+3. Run
+    It lacks of installation instructions at the moment, so do a 'cd' to the
+    project copy and execute from there:
     $ ./fsfs --mount <mount directory>
 
-    For some details:
+    More details:
     $ ./fsfs --help

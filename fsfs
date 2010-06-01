@@ -1,5 +1,4 @@
 #!/usr/bin/python
-
 """
 Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
 
@@ -25,20 +24,26 @@ from os.path import basename, dirname, join, isfile, isabs
 
 fuse.fuse_python_api = (0, 2)
 
-DESCRIPTION       = 'F-Spot FUSE Filesystem'
-FSPOT_DB_FILE     = 'f-spot/photos.db'
-DEFAULT_MOUNTPONT = join(os.environ['HOME'], '.photos')
+DESCRIPTION        = 'F-Spot FUSE Filesystem'
+FSPOT_DB_FILE      = 'f-spot/photos.db'
+FSPOT_DB_VERSION   = 17 # database version supported
+DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
 
 ###
 # SQL sentences
 
+# get F-Spot database version
+DB_VERSION_SQL = """SELECT data FROM meta
+                    WHERE name = "F-Spot Database Version"
+                    LIMIT 1"""
+
 # get real path parts for photo in tag
-FILE_SQL = """SELECT p.base_uri, p.filename
+FILE_SQL = """SELECT replace(p.base_uri, 'file://', ''),
+                     p.filename
               FROM photo_tags pt
               LEFT JOIN photos p
                 ON p.id = pt.photo_id
-              WHERE pt.tag_id = '%s' AND
-                    p.filename LIKE '%%%s'
+              WHERE pt.tag_id = ? AND p.filename = ?
               LIMIT 1"""
 
 # get photos for tag excluding photos in sub-tags
@@ -46,32 +51,32 @@ TAG_PHOTOS = """SELECT p.filename
                 FROM photo_tags pt
                 LEFT JOIN photos p
                     ON p.id = pt.photo_id
-                WHERE pt.tag_id = '%s' AND
+                WHERE pt.tag_id = ? AND
                       pt.photo_id NOT IN (SELECT DISTINCT pt2.photo_id
                                           FROM photo_tags pt2
-                                          WHERE pt2.tag_id IN (%s))"""
+                                          WHERE pt2.tag_id IN %(in_items)s)"""
 
 # photos for leaf tag
 LEAF_PHOTOS = """SELECT p.filename
                  FROM photo_tags pt
                  LEFT JOIN photos p
                     ON p.id = pt.photo_id
-                 WHERE pt.tag_id = '%s'"""
+                 WHERE pt.tag_id = ?"""
 
 # All photos
 ALL_PHOTOS = 'SELECT filename FROM photos'
 
 # return id for tag name
-TAG_ID = """SELECT id FROM tags WHERE name = '%s' LIMIT 1"""
+TAG_ID = 'SELECT id FROM tags WHERE name = ? LIMIT 1'
 
 # tag names
 TAG_NAMES = 'SELECT name FROM tags'
 
 # sub-tag names
-SUBTAG_NAMES = 'SELECT name FROM tags WHERE category_id = %s'
+SUBTAG_NAMES = 'SELECT name FROM tags WHERE category_id = ?'
         
 # sub-tag ids
-SUBTAG_IDS = 'SELECT id FROM tags WHERE category_id = %s'
+SUBTAG_IDS = 'SELECT id FROM tags WHERE category_id = ?'
 
 # Startup time
 GLOBAL_TIME = int(time.time())
@@ -95,17 +100,36 @@ def cls_cached(prefix):
         return wrapper
     return decorator
 
+def with_cursor(fn):
+    """Wraps a function that needs a cursor."""
+    def wrapper(db_path, sql, *params):
+        conn = sqlite3.connect(db_path)
+        if conn:
+            cur = conn.cursor()
+            cur.execute('PRAGMA temp_store = MEMORY');
+            cur.execute('PRAGMA synchronous = OFF');
+            result = fn(cur, db_path, sql, *params)
+            cur.close()
+            return result
+    return wrapper
 
-def execute_query(db_path, sql):
+
+@with_cursor
+def query_multiple(cur, db_path, sql, *params):
     """Executes SQL query."""
-    conn = sqlite3.connect(db_path)
-    if conn:
-        c = conn.cursor()
-        res = list(c.execute(sql))
-        c.close()
-        conn.close()
-        return res
+    cur.execute(sql, params)
+    return cur.fetchall()
 
+@with_cursor
+def query_one(cur, db_path, sql, *params):
+    """Execute sql and return just one row."""
+    cur.execute(sql, params)
+    return cur.fetchone()
+
+def prepare_in(sql, items):
+    """Prepares an sql statement with an IN clause.
+    The sql *must* have an 'in_items' placeholder."""
+    return sql % {'in_items': '(' + ', '.join('?' for item in items) + ')'}
 
 ###
 # Stats for FUSE implementation
@@ -146,16 +170,22 @@ class FSpotFS(fuse.Fuse):
         self.db_path = db_path
         super(FSpotFS, self).__init__(*args, **kwargs)
 
-    def query(self, sql):
+    def query(self, sql, *params):
         """Executes SQL query."""
-        return execute_query(self.db_path, sql)
+        params = tuple(str(param) for param in params)
+        return query_multiple(self.db_path, sql, *params)
+
+    def query_one(self, sql, *params):
+        """Executes SQL query."""
+        params = tuple(str(param) for param in params)
+        return query_one(self.db_path, sql, *params)
 
     @cls_cached('tag_childs')
     def tag_childs(self, parent):
         """Return ids of sub-tags of parent tag. Goes deep in the
         tag hierarchy returning second-level, and deeper subtags."""
         # first-level subtags
-        result = set([str(tag[0]) for tag in self.query(SUBTAG_IDS % parent)])
+        result = set([str(tag[0]) for tag in self.query(SUBTAG_IDS, parent)])
         # second-level subtags and deeper
         next_level = set(reduce(lambda l1, l2: l1 + l2,
                                 [self.tag_childs(tid) for tid in result],
@@ -166,10 +196,10 @@ class FSpotFS(fuse.Fuse):
     def tag_names(self, parent=None):
         """Return tag names for parent or all tag names."""
         if parent is not None:
-            sql = SUBTAG_NAMES % parent
+            tags = self.query(SUBTAG_NAMES, parent)
         else:
-            sql = TAG_NAMES
-        return [tag[0] for tag in self.query(sql)]
+            tags = self.query(TAG_NAMES)
+        return [tag[0] for tag in tags]
 
     @cls_cached('encoded_tags_cache')
     def encoded_tag_names(self):
@@ -180,8 +210,8 @@ class FSpotFS(fuse.Fuse):
     def tag_to_id(self, name):
         """Return tag if for tag name or None."""
         try:
-            return self.query(TAG_ID % name)[0][0]
-        except KeyError:
+            return self.query_one(TAG_ID, name)[0]
+        except (TypeError, KeyError):
             pass
 
     @cls_cached('file_names')
@@ -189,14 +219,15 @@ class FSpotFS(fuse.Fuse):
         """Return photo names tagged as 'parent' or all photos if not parent,
         sub-tags are excluded if any."""
         if parent is not None:
-            childs = self.tag_childs(parent)
-            if childs: # get photos for parent avoiding sub-tags
-                q = TAG_PHOTOS % (parent, ', '.join(childs))
+            children = self.tag_childs(parent)
+            if children: # get photos for parent avoiding sub-tags
+                files = self.query(prepare_in(TAG_PHOTOS, children),
+                                   parent, *children)
             else: # get photos avoiding for parent
-                q = LEAF_PHOTOS % parent
+                files = self.query(LEAF_PHOTOS, parent)
         else: # get all photos
-            q = ALL_PHOTOS
-        return [file[0] for file in self.query(q)]
+            files = self.query(ALL_PHOTOS)
+        return [file[0] for file in files]
 
     @cls_cached('encoded_file_names')
     def encoded_file_names(self):
@@ -206,11 +237,11 @@ class FSpotFS(fuse.Fuse):
     @cls_cached('link_path')
     def link_path(self, tag, name):
         """Return path to filename."""
-        row = self.query(FILE_SQL % (self.tag_to_id(tag), name))
+        row = self.query_one(FILE_SQL, self.tag_to_id(tag), name)
         try:
-            uri, filename = row[0][0].replace('file://', ''), row[0][1]
+            uri, filename = row
             return unquote(join(uri, filename)).encode('utf-8')
-        except IndexError:
+        except (TypeError, IndexError):
             pass
         return ''
 
@@ -279,10 +310,14 @@ def run():
     parser = OptionParser(usage='%prog [options]', description=DESCRIPTION)
     parser.add_option('-d', '--fsdb', action='store', type='string',
                       dest='fsdb', default='',
-                      help='Path to F-Spot sqlite database')
+                      help='Path to F-Spot sqlite database.')
     parser.add_option('-m', '--mount', action='store', type='string',
-                      dest='mountpoint', default=DEFAULT_MOUNTPONT,
-                      help='Mountpoint path')
+                      dest='mountpoint', default=DEFAULT_MOUNTPOINT,
+                      help='Mountpoint path (default %s)' % DEFAULT_MOUNTPOINT)
+    parser.add_option('-v', '--dbversion', action='store', type='string',
+                      dest='dbversion', default=FSPOT_DB_VERSION,
+                      help='F-Spot database schema version to use' \
+                           ' (default v%s)' % FSPOT_DB_VERSION)
     opts = parser.parse_args()[0]
 
     # override F-Spot database path
@@ -302,8 +337,10 @@ def run():
         parser.print_help()
         sys.exit(1)
 
-    server = FSpotFS(fspot_db, version='%prog ' + fuse.__version__,
-                     usage=parser.get_usage())
+    # check database schema compatibility
+    assert int(query_one(fspot_db, DB_VERSION_SQL)[0]) == opts.dbversion
+
+    server = FSpotFS(fspot_db)
     args = server.parse()
     args.mountpoint = opts.mountpoint
     server.main()
