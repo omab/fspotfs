@@ -18,10 +18,14 @@ Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
     * Python SQLite (http://docs.python.org/library/sqlite3.html)
 
 
-3. Run
-    It lacks of installation instructions at the moment, so do a 'cd' to the
-    project copy and execute from there:
-    $ ./fsfs --mount <mount directory>
+3. Installation
+    # python setup.py install
+
+   This will install fspotfs python module and binary fsfs to invoke it
+
+
+4. Run
+    $ fsfs
 
     More details:
     $ ./fsfs --help
