@@ -18,7 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os, sys, stat, errno, fuse, time, sqlite3
 from urllib import unquote
-from optparse import OptionParser
+from optparse import OptionParser, OptionError
 from os.path import basename, dirname, join, isfile, isabs
 
 
@@ -166,8 +166,9 @@ class ImageLinkStat(BaseStat):
 class FSpotFS(fuse.Fuse):
     """F-Spot FUSE filesystem implementation. Just readonly support
     at the moment"""
-    def __init__(self, db_path, *args, **kwargs):
+    def __init__(self, db_path, repeated, *args, **kwargs):
         self.db_path = db_path
+        self.repeated = repeated
         super(FSpotFS, self).__init__(*args, **kwargs)
 
     def query(self, sql, *params):
@@ -215,16 +216,19 @@ class FSpotFS(fuse.Fuse):
             pass
 
     @cls_cached('file_names')
-    def file_names(self, parent=None):
-        """Return photo names tagged as 'parent' or all photos if not parent,
-        sub-tags are excluded if any."""
-        if parent is not None:
-            children = self.tag_childs(parent)
-            if children: # get photos for parent avoiding sub-tags
-                files = self.query(prepare_in(TAG_PHOTOS, children),
-                                   parent, *children)
-            else: # get photos avoiding for parent
-                files = self.query(LEAF_PHOTOS, parent)
+    def file_names(self, tag=None):
+        """Return photo names tagged as 'tag' or all photos if not tag,
+        sub-tags are excluded if self.repeated is false."""
+        if tag is not None:
+            if not self.repeated:
+                children = self.tag_childs(tag)
+                if children: # get photos for tag avoiding sub-tags
+                    files = self.query(prepare_in(TAG_PHOTOS, children),
+                                       tag, *children)
+                else: # get tag photos for current no-parent tag
+                    files = self.query(LEAF_PHOTOS, tag)
+            else: # get tag photos not ignoring repeated
+                files = self.query(LEAF_PHOTOS, tag)
         else: # get all photos
             files = self.query(ALL_PHOTOS)
         return [file[0] for file in files]
@@ -314,11 +318,19 @@ def run():
     parser.add_option('-m', '--mount', action='store', type='string',
                       dest='mountpoint', default=DEFAULT_MOUNTPOINT,
                       help='Mountpoint path (default %s)' % DEFAULT_MOUNTPOINT)
+    parser.add_option('-r', '--repeated', action='store_true', dest='repeated',
+                      help='Show re-tagged images in the same family tree' \
+                           ' (default False)')
     parser.add_option('-v', '--dbversion', action='store', type='string',
                       dest='dbversion', default=FSPOT_DB_VERSION,
                       help='F-Spot database schema version to use' \
                            ' (default v%s)' % FSPOT_DB_VERSION)
-    opts = parser.parse_args()[0]
+    try:
+        opts, args = parser.parse_args()
+    except OptionError, e: # Invalid option
+        print >>sys.stderr, str(e)
+        parser.print_help()
+        sys.exit(1)
 
     # override F-Spot database path
     if opts.fsdb:
@@ -340,10 +352,9 @@ def run():
     # check database schema compatibility
     assert int(query_one(fspot_db, DB_VERSION_SQL)[0]) == opts.dbversion
 
-    server = FSpotFS(fspot_db)
-    args = server.parse()
+    args = fuse.FuseArgs()
     args.mountpoint = opts.mountpoint
-    server.main()
+    FSpotFS(fspot_db, opts.repeated, fuse_args=args).main() # run server
 
 
 if __name__ == '__main__':
