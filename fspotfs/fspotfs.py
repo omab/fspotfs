@@ -26,7 +26,7 @@ fuse.fuse_python_api = (0, 2)
 
 DESCRIPTION        = 'F-Spot FUSE Filesystem'
 FSPOT_DB_FILE      = 'f-spot/photos.db'
-FSPOT_DB_VERSION   = 17.1 # database version supported
+FSPOT_DB_VERSION   = '17' # database version supported
 DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
 ROOT_ID            = 0
 ROOT_NAME          = ''
@@ -94,6 +94,9 @@ UNTAG_PHOTOS_SQL = 'DELETE FROM photo_tags WHERE tag_id = ?'
 
 # remove tag sql
 TAG_REMOVE_SQL = 'DELETE FROM tags WHERE id = ?'
+
+# rename tag sql
+TAG_RENAME_SQL = 'UPDATE tags SET name = ? WHERE id = ?'
 
 # Startup time
 GLOBAL_TIME = int(time.time())
@@ -364,9 +367,23 @@ class FSpotFS(fuse.Fuse):
         self.query_exec(TAG_REMOVE_SQL, tagid) # remove tag
         self.load_tags() # reload cache
 
+    def rename( self, old_path, new_path):
+        """Rename tags. No images rename allowed."""
+        old_tag = basename(old_path)
+        new_tag = basename(new_path)
+        tagid = self.tag_to_id(old_tag)
+        self.query_exec(TAG_RENAME_SQL, new_tag, tagid) # rename tag
+        self.load_tags() # reload cache
+
 
 def run():
     """Parse commandline options and run server"""
+    def param_error(msg, parser):
+        """Print message followed by options usage and exit."""
+        print >>sys.stderr, msg
+        parser.print_help()
+        sys.exit(1)
+
     parser = OptionParser(usage='%prog [options]', description=DESCRIPTION)
     parser.add_option('-d', '--fsdb', action='store', type='string',
                       dest='fsdb', default='',
@@ -386,9 +403,7 @@ def run():
     try:
         opts, args = parser.parse_args()
     except OptionError, e: # Invalid option
-        print >>sys.stderr, str(e)
-        parser.print_help()
-        sys.exit(1)
+        param_error(str(e), parser)
 
     # override F-Spot database path
     if opts.fsdb:
@@ -403,12 +418,22 @@ def run():
         fspot_db = join(os.environ['HOME'], '.config', FSPOT_DB_FILE)
 
     if not isfile(fspot_db):
-        print >>sys.stderr, 'File "%s" not found' % fspot_db
-        parser.print_help()
-        sys.exit(1)
+        param_error('File "%s" not found' % fspot_db, parser)
 
     # check database schema compatibility
-    assert float(query_one(fspot_db, DB_VERSION_SQL)[0]) == opts.dbversion
+    try:
+        float(opts.dbversion) # check if dbversion is float
+        version = opts.dbversion.split('.')
+        fspot_version = query_one(fspot_db, DB_VERSION_SQL)[0].split('.')
+        assert len(fspot_version) >= len(version) and \
+               all(x == y for x, y in zip(fspot_version, version))
+    except ValueError, e:
+        param_error('Incorrect version format "%s"' % opts.dbversion, parser)
+    except AssertionError, e:
+        param_error('Versions mismatch, current database version is "%s",' \
+                    ' passed value was "%s"' % ('.'.join(fspot_version),
+                                                opts.dbversion),
+                    parser)
 
     args = fuse.FuseArgs()
     args.mountpoint = opts.mountpoint
