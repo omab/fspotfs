@@ -26,7 +26,7 @@ fuse.fuse_python_api = (0, 2)
 
 DESCRIPTION        = 'F-Spot FUSE Filesystem'
 FSPOT_DB_FILE      = 'f-spot/photos.db'
-FSPOT_DB_VERSION   = 17 # database version supported
+FSPOT_DB_VERSION   = 17.1 # database version supported
 DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
 
 ###
@@ -350,7 +350,7 @@ def run():
         sys.exit(1)
 
     # check database schema compatibility
-    assert int(query_one(fspot_db, DB_VERSION_SQL)[0]) == opts.dbversion
+    assert float(query_one(fspot_db, DB_VERSION_SQL)[0]) == opts.dbversion
 
     args = fuse.FuseArgs()
     args.mountpoint = opts.mountpoint
