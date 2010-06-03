@@ -28,6 +28,8 @@ DESCRIPTION        = 'F-Spot FUSE Filesystem'
 FSPOT_DB_FILE      = 'f-spot/photos.db'
 FSPOT_DB_VERSION   = 17 # database version supported
 DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
+ROOT_ID            = 0
+ROOT_NAME          = ''
 
 ###
 # SQL sentences
@@ -78,27 +80,41 @@ SUBTAG_NAMES = 'SELECT name FROM tags WHERE category_id = ?'
 # sub-tag ids
 SUBTAG_IDS = 'SELECT id FROM tags WHERE category_id = ?'
 
+# tags
+TAGS_SQL = 'SELECT id, name, category_id FROM tags'
+
+# new tag sql
+NEW_TAG_SQL = """INSERT INTO tags
+                    (name, category_id, is_category, sort_priority, icon)
+                 VALUES
+                    (?, ?, 1, 0, NULL)"""
+
+# untag photos sql
+UNTAG_PHOTOS_SQL = 'DELETE FROM photo_tags WHERE tag_id = ?'
+
+# remove tag sql
+TAG_REMOVE_SQL = 'DELETE FROM tags WHERE id = ?'
+
 # Startup time
 GLOBAL_TIME = int(time.time())
+
 
 ###
 # Internal cache to make queries faster
 _cache = {}
 
-def cls_cached(prefix):
+def cls_cached(fn):
     """Decorator that holds an application cache that stores return
     values to make queries faster."""
-    def decorator(fn):
-        def wrapper(slf, *args, **kwargs):
-            global _cache
-            # generate key
-            key = '_'.join([prefix] + list(map(str, args)) +
-                           filter(None, kwargs.values()))
-            if key not in _cache:
-                _cache[key] = fn(slf, *args, **kwargs)
-            return _cache[key]
-        return wrapper
-    return decorator
+    def wrapper(slf, *args, **kwargs):
+        global _cache
+        # generate key
+        key = '_'.join([fn.func_name] + list(map(str, args)) +
+                       filter(None, kwargs.values()))
+        if key not in _cache:
+            _cache[key] = fn(slf, *args, **kwargs)
+        return _cache[key]
+    return wrapper
 
 def with_cursor(fn):
     """Wraps a function that needs a cursor."""
@@ -108,23 +124,29 @@ def with_cursor(fn):
             cur = conn.cursor()
             cur.execute('PRAGMA temp_store = MEMORY');
             cur.execute('PRAGMA synchronous = OFF');
-            result = fn(cur, db_path, sql, *params)
+            result = fn(conn, cur, db_path, sql, *params)
             cur.close()
             return result
     return wrapper
 
 
 @with_cursor
-def query_multiple(cur, db_path, sql, *params):
+def query_multiple(conn, cur, db_path, sql, *params):
     """Executes SQL query."""
     cur.execute(sql, params)
     return cur.fetchall()
 
 @with_cursor
-def query_one(cur, db_path, sql, *params):
+def query_one(conn, cur, db_path, sql, *params):
     """Execute sql and return just one row."""
     cur.execute(sql, params)
     return cur.fetchone()
+
+@with_cursor
+def query_exec(conn, cur, db_path, sql, *params):
+    """Execute sql."""
+    cur.execute(sql, params)
+    conn.commit()
 
 def prepare_in(sql, items):
     """Prepares an sql statement with an IN clause.
@@ -155,10 +177,12 @@ class ImageLinkStat(BaseStat):
     """Link to Image stat"""
     def __init__(self, path, *args, **kwargs):
         super(ImageLinkStat, self).__init__(*args, **kwargs)
-        self.st_mode = stat.S_IFREG|stat.S_IFLNK|0644
+        self.st_mode = stat.S_IFREG | stat.S_IFLNK | 0644
         self.st_nlink = 0
         os_stat = os.stat(path)
         self.st_size = os_stat.st_size if os_stat else 0
+
+
 
 
 ###
@@ -167,61 +191,77 @@ class FSpotFS(fuse.Fuse):
     """F-Spot FUSE filesystem implementation. Just readonly support
     at the moment"""
     def __init__(self, db_path, repeated, *args, **kwargs):
+        self.tags, self.reverse_tags = {}, {}
         self.db_path = db_path
         self.repeated = repeated
+        self.load_tags()
         super(FSpotFS, self).__init__(*args, **kwargs)
+
+    def load_tags(self):
+        """Loads registered tags and internally cache them"""
+        tags = self.query(TAGS_SQL)
+        self.tags[ROOT_ID] = {'children': {}, 'name': ROOT_NAME,
+                              'parent': None}
+        self.reverse_tags[ROOT_NAME] = ROOT_ID
+
+        # load tags
+        for id, name, category_id in tags:
+            self.tags[id] = {'children': {},
+                             'name': name,
+                             'parent': category_id}
+            self.reverse_tags[name] = id
+
+        # setup parent-child relations
+        for id, name, category_id in tags:
+            if category_id in self.tags:
+                self.tags[category_id]['children'][id] = self.tags[id]
 
     def query(self, sql, *params):
         """Executes SQL query."""
-        params = tuple(str(param) for param in params)
         return query_multiple(self.db_path, sql, *params)
 
     def query_one(self, sql, *params):
         """Executes SQL query."""
-        params = tuple(str(param) for param in params)
         return query_one(self.db_path, sql, *params)
 
-    @cls_cached('tag_childs')
-    def tag_childs(self, parent):
+    def query_exec(self, sql, *params):
+        """Executes SQL query."""
+        return query_exec(self.db_path, sql, *params)
+
+    def tag_children(self, parent):
         """Return ids of sub-tags of parent tag. Goes deep in the
         tag hierarchy returning second-level, and deeper subtags."""
         # first-level subtags
-        result = set([str(tag[0]) for tag in self.query(SUBTAG_IDS, parent)])
+        result = self.tags[parent]['children'].keys()
         # second-level subtags and deeper
         next_level = set(reduce(lambda l1, l2: l1 + l2,
-                                [self.tag_childs(tid) for tid in result],
+                                [self.tag_children(tid) for tid in result],
                                 []))
-        return list(result) + list(next_level)
+        return result + list(next_level)
 
-    @cls_cached('tag_names')
     def tag_names(self, parent=None):
         """Return tag names for parent or all tag names."""
-        if parent is not None:
-            tags = self.query(SUBTAG_NAMES, parent)
-        else:
-            tags = self.query(TAG_NAMES)
-        return [tag[0] for tag in tags]
+        tags = self.tags
+        try:
+            if parent is not None:
+                tags = tags[parent]['children']
+        except KeyError:
+            return []
+        return [tag['name'] for tag in tags.itervalues()]
 
-    @cls_cached('encoded_tags_cache')
-    def encoded_tag_names(self):
-        """Return encoded tag names."""
-        return [i.encode('utf-8') for i in self.tag_names()]
-
-    @cls_cached('tag_to_id')
     def tag_to_id(self, name):
         """Return tag if for tag name or None."""
         try:
-            return self.query_one(TAG_ID, name)[0]
-        except (TypeError, KeyError):
+            return self.reverse_tags[name]
+        except KeyError:
             pass
 
-    @cls_cached('file_names')
     def file_names(self, tag=None):
         """Return photo names tagged as 'tag' or all photos if not tag,
         sub-tags are excluded if self.repeated is false."""
         if tag is not None:
             if not self.repeated:
-                children = self.tag_childs(tag)
+                children = self.tag_children(tag)
                 if children: # get photos for tag avoiding sub-tags
                     files = self.query(prepare_in(TAG_PHOTOS, children),
                                        tag, *children)
@@ -233,32 +273,28 @@ class FSpotFS(fuse.Fuse):
             files = self.query(ALL_PHOTOS)
         return [file[0] for file in files]
 
-    @cls_cached('encoded_file_names')
-    def encoded_file_names(self):
-        """Encode file names."""
-        return [i.encode('utf-8') for i in self.file_names()]
-
-    @cls_cached('link_path')
     def link_path(self, tag, name):
         """Return path to filename."""
-        row = self.query_one(FILE_SQL, self.tag_to_id(tag), name)
-        try:
-            uri, filename = row
-            return unquote(join(uri, filename)).encode('utf-8')
-        except (TypeError, IndexError):
-            pass
+        tagid = self.tag_to_id(tag)
+        if tagid is not None:
+            row = self.query_one(FILE_SQL, tagid, name)
+            try:
+                uri, filename = row
+                return unquote(join(uri, filename)).encode('utf-8')
+            except (TypeError, IndexError):
+                pass
         return ''
 
     def is_dir(self, path):
         """Check if path is a directory in f-spot."""
         return path in ('.', '..', '/') or \
-               basename(path) in self.encoded_tag_names()
+               basename(path) in [i.encode('utf-8') for i in self.tag_names()]
 
     def is_file(self, path):
         """Check if path is a file in f-spot."""
-        return basename(path) in self.encoded_file_names()
+        # TODO: Improve with querying to database
+        return basename(path) in [i.encode('utf-8') for i in self.file_names()]
 
-    @cls_cached('getattr')
     def getattr(self, path):
         """Getattr handler."""
         if self.is_dir(path):
@@ -270,12 +306,10 @@ class FSpotFS(fuse.Fuse):
                 return ImageLinkStat(self.link_path(tag, fname))
         return -errno.ENOENT
 
-    @cls_cached('readlink')
     def readlink(self, path):
         """Readlink handler."""
         return self.link_path(basename(dirname(path)), basename(path))
 
-    @cls_cached('access')
     def access(self, path, offset):
         """Check file access."""
         # Access granted by default at the moment, unless the file does
@@ -293,9 +327,8 @@ class FSpotFS(fuse.Fuse):
         for item in self._readdir(path, offset):
             yield item
 
-    @cls_cached('readdir')
     def _readdir(self, path, offset):
-        parent = 0 if path == '/' else self.tag_to_id(basename(path))
+        parent = self.tag_to_id(basename(path))
 
         dirs = [fuse.Direntry(r.encode('utf-8'))
                     for r in self.tag_names(parent)]
@@ -307,6 +340,29 @@ class FSpotFS(fuse.Fuse):
         files.sort(key=lambda x: x.name)
 
         return [fuse.Direntry('.'), fuse.Direntry('..')] + dirs + files
+
+    def mkdir(self, path, mode):
+        """Register new tag or sub-tag and display it as a new directory."""
+        name = basename(path)
+        parent_id = self.tag_to_id(basename(dirname(path)))
+        # register in database
+        self.query_exec(NEW_TAG_SQL, name.encode('utf-8'), parent_id)
+        self.load_tags() # reload cache
+        return 0
+
+    def rmdir(self, path):
+        """Removes a directory, unregister the tags and the photos tagged
+        by it. Only subdirectories without sub-directories (tags without
+        sub-tags).
+        """
+        tagid = self.tag_to_id(basename(path))
+        children = self.tag_children(tagid)
+
+        if children: # tag with sub-tags removal not allowed
+            return -errno.EINVAL
+        self.query_exec(UNTAG_PHOTOS_SQL, tagid) # untag photos
+        self.query_exec(TAG_REMOVE_SQL, tagid) # remove tag
+        self.load_tags() # reload cache
 
 
 def run():
@@ -325,6 +381,8 @@ def run():
                       dest='dbversion', default=FSPOT_DB_VERSION,
                       help='F-Spot database schema version to use' \
                            ' (default v%s)' % FSPOT_DB_VERSION)
+    parser.add_option('-l', '--log', action='store_true', dest='log',
+                      help='Shows FUSE log (default False)')
     try:
         opts, args = parser.parse_args()
     except OptionError, e: # Invalid option
@@ -354,6 +412,8 @@ def run():
 
     args = fuse.FuseArgs()
     args.mountpoint = opts.mountpoint
+    if opts.log:
+        args.add('debug')
     FSpotFS(fspot_db, opts.repeated, fuse_args=args).main() # run server
 
 

@@ -1,3 +1,5 @@
 build/
 dist/
 F_Spot_FS.egg-info/
+*.pyc
+.*.swp
