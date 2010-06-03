@@ -175,8 +175,6 @@ class ImageLinkStat(BaseStat):
         self.st_size = os_stat.st_size if os_stat else 0
 
 
-
-
 ###
 # FUSE F-Spot FS
 class FSpotFS(fuse.Fuse):
@@ -361,6 +359,10 @@ class FSpotFS(fuse.Fuse):
         old_tag = basename(old_path)
         new_tag = basename(new_path)
         tagid = self.tag_to_id(old_tag)
+        if not tagid: # original tag does not exist
+            return -errno.ENOENT
+        if self.tag_to_id(new_tag): # new name already exists
+            return -errno.EINVAL
         self.query_exec(TAG_RENAME_SQL, new_tag, tagid) # rename tag
         self.load_tags() # reload cache
 
