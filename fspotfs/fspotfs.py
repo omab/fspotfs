@@ -31,6 +31,10 @@ DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
 ROOT_ID            = 0
 ROOT_NAME          = ''
 
+# Current user UID and GID
+UID = os.getuid()
+GID = os.getgid()
+
 ###
 # SQL sentences
 
@@ -101,24 +105,6 @@ TAG_RENAME_SQL = 'UPDATE tags SET name = ? WHERE id = ?'
 # Startup time
 GLOBAL_TIME = int(time.time())
 
-
-###
-# Internal cache to make queries faster
-_cache = {}
-
-def cls_cached(fn):
-    """Decorator that holds an application cache that stores return
-    values to make queries faster."""
-    def wrapper(slf, *args, **kwargs):
-        global _cache
-        # generate key
-        key = '_'.join([fn.func_name] + list(map(str, args)) +
-                       filter(None, kwargs.values()))
-        if key not in _cache:
-            _cache[key] = fn(slf, *args, **kwargs)
-        return _cache[key]
-    return wrapper
-
 def with_cursor(fn):
     """Wraps a function that needs a cursor."""
     def wrapper(db_path, sql, *params):
@@ -166,6 +152,9 @@ class BaseStat(fuse.Stat):
         """Init atime, mtime and ctime."""
         super(BaseStat, self).__init__(*args, **kwargs)
         self.st_atime = self.st_mtime = self.st_ctime = GLOBAL_TIME
+        # set current user UID and GID to hierarchy nodes
+        self.st_uid = UID
+        self.st_gid = GID
 
 
 class DirStat(BaseStat):
