@@ -19,7 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import os, sys, stat, errno, fuse, time, sqlite3
 from urllib import unquote
 from optparse import OptionParser, OptionError
-from os.path import basename, dirname, join, isfile, isabs
+from os.path import basename, dirname, join, isfile, isabs, isdir, exists
 
 
 fuse.fuse_python_api = (0, 2)
@@ -371,7 +371,7 @@ def run():
     """Parse commandline options and run server"""
     def param_error(msg, parser):
         """Print message followed by options usage and exit."""
-        print >>sys.stderr, msg
+        print >>sys.stderr, msg, '\n'
         parser.print_help()
         sys.exit(1)
 
@@ -426,8 +426,12 @@ def run():
                                                 opts.dbversion),
                     parser)
 
+    mountpoint = opts.mountpoint
+    if not exists(mountpoint) or not isdir(mountpoint):
+        param_error('Invalid mountpoint "%s"' % mountpoint, parser)
+
     args = fuse.FuseArgs()
-    args.mountpoint = opts.mountpoint
+    args.mountpoint = mountpoint
     if opts.log:
         args.add('debug')
     FSpotFS(fspot_db, opts.repeated, fuse_args=args).main() # run server
