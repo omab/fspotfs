@@ -16,13 +16,26 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-import os, sys, stat, errno, fuse, time, sqlite3
+import os, sys, stat, errno, fuse, time, sqlite3, tempfile, Image, ExifTags, \
+       shutil
+from datetime import datetime
 from urllib import unquote
 from optparse import OptionParser, OptionError
 from os.path import basename, dirname, join, isfile, isabs, isdir, exists
 
 
-fuse.fuse_python_api = (0, 2)
+# F-Spot gconf key that stores user collection path,
+# this should be on database IMO
+FSPOT_SP_GCONF_KEY = '/apps/f-spot/import/storage_path'
+
+try:
+    import gconf
+    COLLECTION_ROOT = gconf.client_get_default().get_value(FSPOT_SP_GCONF_KEY)
+    # DateTime Exif Tag id
+    DATETIME_ID = dict((v, k) for k, v in ExifTags.TAGS.iteritems())['DateTime']
+    DISABLE_IMPORT = False
+except (ImportError, KeyError):
+    DISABLE_IMPORT = True
 
 DESCRIPTION        = 'F-Spot FUSE Filesystem'
 FSPOT_DB_FILE      = 'f-spot/photos.db'
@@ -30,6 +43,7 @@ FSPOT_DB_VERSION   = '17' # database version supported
 DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
 ROOT_ID            = 0
 ROOT_NAME          = ''
+EXIF_DATEFORMAT    = '%Y:%m:%d %H:%M:%S'
 
 # Current user UID and GID
 UID = os.getuid()
@@ -80,7 +94,7 @@ TAG_NAMES = 'SELECT name FROM tags'
 
 # sub-tag names
 SUBTAG_NAMES = 'SELECT name FROM tags WHERE category_id = ?'
-        
+
 # sub-tag ids
 SUBTAG_IDS = 'SELECT id FROM tags WHERE category_id = ?'
 
@@ -102,8 +116,27 @@ TAG_REMOVE_SQL = 'DELETE FROM tags WHERE id = ?'
 # rename tag sql
 TAG_RENAME_SQL = 'UPDATE tags SET name = ? WHERE id = ?'
 
+# register image sql
+ADD_IMAGE_SQL = """INSERT INTO photos (time, base_uri, filename, description,
+                                       roll_id, default_version_id, rating,
+                                       md5_sum)
+                   VALUES (?, ?, ?, '', 1, 1, 0, NULL)"""
+
+# select image sql
+IMAGE_ID_SQL = 'SELECT id FROM photos WHERE base_uri = ? AND filename = ?'
+
+# photo version insert
+ADD_VERSION_SQL = """INSERT INTO photo_versions (photo_id, version_id, name,
+                                                 base_uri, filename, md5_sum,
+                                                 protected)
+                     VALUES (?, 1, 'Original', ?, ?, NULL, 1)"""
+
+# tag image sql
+TAG_IMAGE = 'INSERT INTO photo_tags (photo_id, tag_id) VALUES (?, ?)'
+
+
 # Startup time
-GLOBAL_TIME = int(time.time())
+GLOBAL_TIME = long(time.time())
 
 def with_cursor(fn):
     """Wraps a function that needs a cursor."""
@@ -175,13 +208,21 @@ class ImageLinkStat(BaseStat):
         self.st_size = os_stat.st_size if os_stat else 0
 
 
+class NewFileState(BaseStat):
+    def __init__(self, *args, **kwargs):
+        super(NewFileState, self).__init__(*args, **kwargs)
+        self.st_mode = stat.S_IFREG | 0644
+        self.st_nlink = 0
+        self.st_size = 0
+
+
 ###
 # FUSE F-Spot FS
 class FSpotFS(fuse.Fuse):
     """F-Spot FUSE filesystem implementation. Just readonly support
     at the moment"""
     def __init__(self, db_path, repeated, *args, **kwargs):
-        self.tags, self.reverse_tags = {}, {}
+        self.tags, self.reverse_tags, self.creation_pool  = {}, {}, {}
         self.db_path = db_path
         self.repeated = repeated
         self.load_tags()
@@ -229,7 +270,7 @@ class FSpotFS(fuse.Fuse):
                                 []))
         return result + list(next_level)
 
-    def tag_names(self, parent=None):
+    def tag_names(self, parent=None, sorted=False):
         """Return tag names for parent or all tag names."""
         tags = self.tags
         try:
@@ -237,7 +278,10 @@ class FSpotFS(fuse.Fuse):
                 tags = tags[parent]['children']
         except KeyError:
             return []
-        return [tag['name'] for tag in tags.itervalues()]
+        values = [tag['name'] for tag in tags.itervalues()]
+        if sorted:
+            values.sort()
+        return values
 
     def tag_to_id(self, name):
         """Return tag if for tag name or None."""
@@ -246,11 +290,12 @@ class FSpotFS(fuse.Fuse):
         except KeyError:
             pass
 
-    def file_names(self, tag=None):
+    def file_names(self, tag=None, sorted=False):
         """Return photo names tagged as 'tag' or all photos if not tag,
         sub-tags are excluded if self.repeated is false."""
         if tag is not None:
-            if not self.repeated:
+            # treat root directory as it doesn't have sub-categories
+            if tag != ROOT_ID and not self.repeated:
                 children = self.tag_children(tag)
                 if children: # get photos for tag avoiding sub-tags
                     files = self.query(prepare_in(TAG_PHOTOS, children),
@@ -261,7 +306,10 @@ class FSpotFS(fuse.Fuse):
                 files = self.query(LEAF_PHOTOS, tag)
         else: # get all photos
             files = self.query(ALL_PHOTOS)
-        return [file[0] for file in files]
+        result = [file[0] for file in files]
+        if sorted:
+            result.sort()
+        return result
 
     def link_path(self, tag, name):
         """Return path to filename."""
@@ -287,6 +335,10 @@ class FSpotFS(fuse.Fuse):
 
     def getattr(self, path):
         """Getattr handler."""
+        return self._getattr(path) or -errno.ENOENT
+
+    def _getattr(self, path):
+        """Hierarchy stats builder, will return None if path is invalid."""
         if self.is_dir(path):
             return DirStat()
         elif self.is_file(path):
@@ -294,7 +346,9 @@ class FSpotFS(fuse.Fuse):
             tag = basename(dirname(path))
             if fname in self.file_names(self.tag_to_id(tag)):
                 return ImageLinkStat(self.link_path(tag, fname))
-        return -errno.ENOENT
+        elif not DISABLE_IMPORT and path in self.creation_pool:
+            return NewFileState()
+        return None
 
     def readlink(self, path):
         """Readlink handler."""
@@ -304,32 +358,21 @@ class FSpotFS(fuse.Fuse):
         """Check file access."""
         # Access granted by default at the moment, unless the file does
         # not exists
-        if self.is_dir(path) or \
-           self.is_file(path) and \
-           basename(path) in \
-           self.file_names(self.tag_to_id(basename(dirname(path)))):
-            return 0
-        return -errno.EINVAL
+        return -errno.EINVAL if self._getattr(path) is None else 0
 
     def readdir(self, path, offset):
         """Readdier handler."""
-        # Yields items returned by _readdir method
-        for item in self._readdir(path, offset):
-            yield item
-
-    def _readdir(self, path, offset):
         parent = self.tag_to_id(basename(path))
+        link_type = stat.S_IFREG | stat.S_IFLNK
 
-        dirs = [fuse.Direntry(r.encode('utf-8'))
-                    for r in self.tag_names(parent)]
-        dirs.sort(key=lambda x: x.name)
+        yield fuse.Direntry('.')
+        yield fuse.Direntry('..')
 
-        type = stat.S_IFREG | stat.S_IFLNK
-        files = [fuse.Direntry(i.encode('utf-8'), type=type)
-                    for i in self.file_names(parent)]
-        files.sort(key=lambda x: x.name)
+        for name in self.tag_names(parent, sorted=True):
+            yield fuse.Direntry(name.encode('utf-8'))
 
-        return [fuse.Direntry('.'), fuse.Direntry('..')] + dirs + files
+        for name in self.file_names(parent, sorted=True):
+            yield fuse.Direntry(name.encode('utf-8'), type=link_type)
 
     def mkdir(self, path, mode):
         """Register new tag or sub-tag and display it as a new directory."""
@@ -356,8 +399,8 @@ class FSpotFS(fuse.Fuse):
 
     def rename( self, old_path, new_path):
         """Rename tags. No images rename allowed."""
-        old_tag = basename(old_path)
-        new_tag = basename(new_path)
+        old_tag, new_tag = basename(old_path), basename(new_path)
+
         tagid = self.tag_to_id(old_tag)
         if not tagid: # original tag does not exist
             return -errno.ENOENT
@@ -365,6 +408,132 @@ class FSpotFS(fuse.Fuse):
             return -errno.EINVAL
         self.query_exec(TAG_RENAME_SQL, new_tag, tagid) # rename tag
         self.load_tags() # reload cache
+
+    def create(self, path, flags, mode):
+        """Create file handler."""
+        if DISABLE_IMPORT: # no support if import is disabled
+            return -errno.ENOSYS
+
+        if path not in self.creation_pool:
+            # Write to a temporary file that will be moved later
+            # this is because we don't know the file metadata until
+            # it's written
+            fd, tmp_path = tempfile.mkstemp()
+            # Register path in our creation pool, this way avoid
+            # failures to OS on getattr
+            self.creation_pool[path] = (fd, tmp_path)
+        return self.creation_pool[path]
+
+    def write(self, path, buff, offs, data=None):
+        """Write file handler."""
+        if DISABLE_IMPORT: # no support if import is disabled
+            return -errno.ENOSYS
+        if path not in self.creation_pool: # file was not created
+            return -errno.ENOENT
+        fd, tmp_path = (data or self.creation_pool[path])
+        return os.write(fd, buff) # write to temp file
+
+    def release(self, path, flags, data=None):
+        """Release file handler.
+
+        Will move temporary written file to collection structure and tag
+        properly.
+        """
+        if DISABLE_IMPORT: # no support if import is disabled
+            return -errno.ENOSYS
+        if path not in self.creation_pool: # file was not created
+            return -errno.ENOENT
+
+        fd, tmp_path = (data or self.creation_pool[path])
+        os.close(fd) # close temporary file
+
+        def cleanup(result=-errno.EINVAL):
+            """Clanups files."""
+            self.creation_pool.pop(path)
+            if isfile(tmp_path):
+                os.remove(tmp_path)
+            return result
+
+        tagid = self.tag_to_id(basename(dirname(path)))
+        if tagid is None: # destination tag does not exists
+            return cleanup()
+
+        try: # open image on temporary location
+            img = Image.open(tmp_path)
+        except IOError, e:
+            return cleanup()
+
+        try: # try to get date from exif
+            exif_date = img._getexif()[DATETIME_ID]
+            date = datetime.strptime(exif_date, EXIF_DATEFORMAT)
+        except KeyError, e: # use today date in error
+            date = datetime.now()
+
+        # build base path /collection-root/<year>/<month>/<day>/
+        base = join(COLLECTION_ROOT, str(date.year),
+                    '%02d' % date.month, '%02d' % date.day)
+        if not isdir(base): # build collection directory
+            try:
+                os.makedirs(base)
+            except OSError:
+                return cleanup()
+
+        name = basename(path)
+        dest = join(base, name)
+        if isfile(dest): # no ovewrite support yet
+            return cleanup()
+
+        try:
+            shutil.move(tmp_path, dest)
+        except OSError, e:
+            return cleanup()
+
+        # register on database
+        base_uri = self.base_uri(base)
+        self.query_exec(ADD_IMAGE_SQL, int(time.time()), base_uri, name)
+        last_id = self.query_one(IMAGE_ID_SQL, base_uri, name)[0]
+        self.query_exec(ADD_VERSION_SQL, last_id, base_uri, name)
+        self.query_exec(TAG_IMAGE, last_id, tagid)
+
+        return cleanup(result=0)
+
+    def chmod(self, path, *args, **kwargs):
+        """Chmod support (called when moving images)"""
+        return 0
+
+    def chmown(self, path, *args, **kwargs):
+        """Chown support (called when moving images)"""
+        return 0
+
+    def symlink(self, source, target):
+        """Linking or symbolic link copying handler.
+
+        If linking is inside collection
+            source: is absolute path to image in collection directory
+            target: is relative path in virtual filesystem.
+
+        If linking is from outside is not supported.
+        """
+        # TODO: Support linking from outside using create
+        if source.startswith(COLLECTION_ROOT):
+            name = basename(source)
+            tag_id = self.tag_to_id(basename(dirname(target)))
+            image_id = self.query_one(IMAGE_ID_SQL,
+                                      self.base_uri(dirname(source)),
+                                      name)[0]
+            self.query_exec(TAG_IMAGE, image_id, tag_id)
+            return 0
+        else:
+            return -errno.ENOSYS
+
+    def base_uri(self, path):
+        """Builds baseuri for path.
+
+        Path needs to be absolute or will be converted.
+        """
+        if not path.startswith('/'):
+            path = '/' + path
+        return 'file://' + path
 
 
 def run():
@@ -430,6 +599,7 @@ def run():
     if not exists(mountpoint) or not isdir(mountpoint):
         param_error('Invalid mountpoint "%s"' % mountpoint, parser)
 
+    fuse.fuse_python_api = (0, 2)
     args = fuse.FuseArgs()
     args.mountpoint = mountpoint
     if opts.log:
