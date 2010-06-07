@@ -58,8 +58,7 @@ DB_VERSION_SQL = """SELECT data FROM meta
                     LIMIT 1"""
 
 # get real path parts for photo in tag
-FILE_SQL = """SELECT replace(p.base_uri, 'file://', ''),
-                     p.filename
+FILE_SQL = """SELECT replace(p.base_uri, 'file://', '') || '/' || p.filename
               FROM photo_tags pt
               LEFT JOIN photos p
                 ON p.id = pt.photo_id
@@ -311,17 +310,11 @@ class FSpotFS(fuse.Fuse):
             result.sort()
         return result
 
-    def link_path(self, tag, name):
-        """Return path to filename."""
-        tagid = self.tag_to_id(tag)
-        if tagid is not None:
-            row = self.query_one(FILE_SQL, tagid, name)
-            try:
-                uri, filename = row
-                return unquote(join(uri, filename)).encode('utf-8')
-            except (TypeError, IndexError):
-                pass
-        return ''
+    def real_path(self, tagid, name):
+        """Return real file path in collection."""
+        row = self.query_one(FILE_SQL, tagid, name)
+        if row is not None:
+            return unquote(row[0]).encode('utf-8')
 
     def is_dir(self, path):
         """Check if path is a directory in f-spot."""
@@ -344,15 +337,17 @@ class FSpotFS(fuse.Fuse):
         elif self.is_file(path):
             fname = basename(path)
             tag = basename(dirname(path))
-            if fname in self.file_names(self.tag_to_id(tag)):
-                return ImageLinkStat(self.link_path(tag, fname))
+            tagid = self.tag_to_id(tag)
+            if fname in self.file_names(tagid):
+                return ImageLinkStat(self.real_path(tagid, fname))
         elif not DISABLE_IMPORT and path in self.creation_pool:
             return NewFileState()
         return None
 
     def readlink(self, path):
         """Readlink handler."""
-        return self.link_path(basename(dirname(path)), basename(path))
+        return self.real_path(self.tag_to_id(basename(dirname(path))),
+                              basename(path))
 
     def access(self, path, offset):
         """Check file access."""
@@ -460,13 +455,13 @@ class FSpotFS(fuse.Fuse):
 
         try: # open image on temporary location
             img = Image.open(tmp_path)
-        except IOError, e:
+        except IOError:
             return cleanup()
 
         try: # try to get date from exif
             exif_date = img._getexif()[DATETIME_ID]
             date = datetime.strptime(exif_date, EXIF_DATEFORMAT)
-        except KeyError, e: # use today date in error
+        except (KeyError, TypeError): # use today date in error
             date = datetime.now()
 
         # build base path /collection-root/<year>/<month>/<day>/
@@ -479,21 +474,26 @@ class FSpotFS(fuse.Fuse):
                 return cleanup()
 
         name = basename(path)
-        dest = join(base, name)
-        if isfile(dest): # no ovewrite support yet
-            return cleanup()
-
-        try:
-            shutil.move(tmp_path, dest)
-        except OSError, e:
-            return cleanup()
-
-        # register on database
         base_uri = self.base_uri(base)
-        self.query_exec(ADD_IMAGE_SQL, int(time.time()), base_uri, name)
-        last_id = self.query_one(IMAGE_ID_SQL, base_uri, name)[0]
-        self.query_exec(ADD_VERSION_SQL, last_id, base_uri, name)
-        self.query_exec(TAG_IMAGE, last_id, tagid)
+
+        # ovewrite is not supported, lets assume they are the same
+        # files and retag it
+        dest = join(base, name)
+        if not isfile(dest):
+            try:
+                shutil.move(tmp_path, dest)
+            except OSError:
+                return cleanup()
+
+            # register on database
+            self.query_exec(ADD_IMAGE_SQL, int(time.time()), base_uri, name)
+            image_id = self.query_one(IMAGE_ID_SQL, base_uri, name)[0]
+            self.query_exec(ADD_VERSION_SQL, image_id, base_uri, name)
+        else:
+            image_id = self.query_one(IMAGE_ID_SQL, base_uri, name)[0]
+
+        if self.real_path(tagid, name) is None: # tag it, if not already tagged
+            self.query_exec(TAG_IMAGE, image_id, tagid)
 
         return cleanup(result=0)
 
@@ -587,9 +587,9 @@ def run():
         fspot_version = query_one(fspot_db, DB_VERSION_SQL)[0].split('.')
         assert len(fspot_version) >= len(version) and \
                all(x == y for x, y in zip(fspot_version, version))
-    except ValueError, e:
+    except ValueError:
         param_error('Incorrect version format "%s"' % opts.dbversion, parser)
-    except AssertionError, e:
+    except AssertionError:
         param_error('Versions mismatch, current database version is "%s",' \
                     ' passed value was "%s"' % ('.'.join(fspot_version),
                                                 opts.dbversion),
