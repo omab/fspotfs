@@ -19,7 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import os, sys, stat, errno, fuse, time, sqlite3, tempfile, Image, ExifTags, \
        shutil
 from datetime import datetime
-from urllib import unquote
+from urllib import unquote, quote
 from optparse import OptionParser, OptionError
 from os.path import basename, dirname, join, isfile, isabs, isdir, exists
 
@@ -44,6 +44,7 @@ DEFAULT_MOUNTPOINT = join(os.environ['HOME'], '.photos')
 ROOT_ID            = 0
 ROOT_NAME          = ''
 EXIF_DATEFORMAT    = '%Y:%m:%d %H:%M:%S'
+LINK_TYPE          = stat.S_IFREG | stat.S_IFLNK
 
 # Current user UID and GID
 UID = os.getuid()
@@ -58,32 +59,45 @@ DB_VERSION_SQL = """SELECT data FROM meta
                     LIMIT 1"""
 
 # get real path parts for photo in tag
-FILE_SQL = """SELECT replace(p.base_uri, 'file://', '') || '/' || p.filename
+FILE_SQL = """SELECT ifnull(v.base_uri, p.base_uri), ifnull(v.filename, p.filename)
               FROM photo_tags pt
               LEFT JOIN photos p
                 ON p.id = pt.photo_id
-              WHERE pt.tag_id = ? AND p.filename = ?
+              LEFT JOIN photo_versions v
+                ON v.photo_id = p.id AND
+                   v.version_id = p.default_version_id
+              WHERE pt.tag_id = ? AND (v.filename = ? or p.filename = ?)
               LIMIT 1"""
 
 # get photos for tag excluding photos in sub-tags
-TAG_PHOTOS = """SELECT p.filename
+TAG_PHOTOS = """SELECT ifnull(v.filename, p.filename)
                 FROM photo_tags pt
                 LEFT JOIN photos p
                     ON p.id = pt.photo_id
+                LEFT JOIN photo_versions v
+                    ON v.photo_id = p.id AND
+                       v.version_id = p.default_version_id
                 WHERE pt.tag_id = ? AND
                       pt.photo_id NOT IN (SELECT DISTINCT pt2.photo_id
                                           FROM photo_tags pt2
                                           WHERE pt2.tag_id IN %(in_items)s)"""
 
 # photos for leaf tag
-LEAF_PHOTOS = """SELECT p.filename
+LEAF_PHOTOS = """SELECT ifnull(v.filename, p.filename)
                  FROM photo_tags pt
                  LEFT JOIN photos p
                     ON p.id = pt.photo_id
+                 LEFT JOIN photo_versions v
+                    ON v.photo_id = p.id AND
+                       v.version_id = p.default_version_id
                  WHERE pt.tag_id = ?"""
 
 # All photos
-ALL_PHOTOS = 'SELECT filename FROM photos'
+ALL_PHOTOS = """SELECT ifnull(v.filename, p.filename)
+                FROM photos p
+                LEFT JOIN photo_versions v
+                    ON v.photo_id = p.id AND
+                       v.version_id = p.default_version_id"""
 
 # return id for tag name
 TAG_ID = 'SELECT id FROM tags WHERE name = ? LIMIT 1'
@@ -312,19 +326,26 @@ class FSpotFS(fuse.Fuse):
 
     def real_path(self, tagid, name):
         """Return real file path in collection."""
-        row = self.query_one(FILE_SQL, tagid, name)
+        name = self.quote_name(name)
+        row = self.query_one(FILE_SQL, tagid, name, name)
         if row is not None:
-            return unquote(row[0]).encode('utf-8')
+            base_uri, filename = row
+            return unquote(join(base_uri.replace('file://', ''), filename)).\
+                          encode('utf-8')
 
     def is_dir(self, path):
         """Check if path is a directory in f-spot."""
         return path in ('.', '..', '/') or \
                basename(path) in [i.encode('utf-8') for i in self.tag_names()]
 
+    def quote_name(self, name):
+        return quote(name, safe='()')
+
     def is_file(self, path):
         """Check if path is a file in f-spot."""
         # TODO: Improve with querying to database
-        return basename(path) in [i.encode('utf-8') for i in self.file_names()]
+        return self.quote_name(basename(path)) in \
+                    [i.encode('utf-8') for i in self.file_names()]
 
     def getattr(self, path):
         """Getattr handler."""
@@ -358,16 +379,15 @@ class FSpotFS(fuse.Fuse):
     def readdir(self, path, offset):
         """Readdier handler."""
         parent = self.tag_to_id(basename(path))
-        link_type = stat.S_IFREG | stat.S_IFLNK
 
         yield fuse.Direntry('.')
         yield fuse.Direntry('..')
 
         for name in self.tag_names(parent, sorted=True):
-            yield fuse.Direntry(name.encode('utf-8'))
+            yield fuse.Direntry(unquote(name.encode('utf-8')))
 
         for name in self.file_names(parent, sorted=True):
-            yield fuse.Direntry(name.encode('utf-8'), type=link_type)
+            yield fuse.Direntry(unquote(name.encode('utf-8')), type=LINK_TYPE)
 
     def mkdir(self, path, mode):
         """Register new tag or sub-tag and display it as a new directory."""
@@ -461,7 +481,7 @@ class FSpotFS(fuse.Fuse):
         try: # try to get date from exif
             exif_date = img._getexif()[DATETIME_ID]
             date = datetime.strptime(exif_date, EXIF_DATEFORMAT)
-        except (KeyError, TypeError): # use today date in error
+        except (KeyError, TypeError, ValueError): # use today date in error
             date = datetime.now()
 
         # build base path /collection-root/<year>/<month>/<day>/
@@ -533,6 +553,8 @@ class FSpotFS(fuse.Fuse):
         """
         if not path.startswith('/'):
             path = '/' + path
+        if not path.endswith('/'):
+            path = path + '/'
         return 'file://' + path
 
 
