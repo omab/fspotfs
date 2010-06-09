@@ -1,4 +1,4 @@
-F-Spot FUSE filesystem with read only access only at the moment.
+F-Spot FUSE filesystem
 Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
 
 
@@ -10,10 +10,15 @@ Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
 
     Images are soft links to original files.
 
+    Write access is available, when copying/moving a file into the virtual
+    filesystem, implies copying to collection directory (defined in gconf)
+    and tagging properly.
+
 
 2. Dependencies
     * F-Spot of course, but it's photos database actually (http://f-spot.org)
-      with schema version at least 17
+      with schema version 17 at least 17, also it's gconf configuration is
+      needed
     * Python FUSE (http://pypi.python.org/pypi/fuse-python/)
     * Python SQLite (http://docs.python.org/library/sqlite3.html)
 
