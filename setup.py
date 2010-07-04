@@ -18,7 +18,7 @@ setup_args = {
 
 try:
     from setuptools import setup
-    setup_args['install_requires'] = ['fuse-python>=0.2']
+    setup_args['install_requires'] = ['fuse-python>=0.2', 'python-sqlalchemy>=0.5.8']
 except ImportError:
     from distutils.core import setup
 

@@ -21,7 +21,7 @@ Copyright (C) 2009  Matias Aguirre <matiasaguirre@gmail.com>
       needed
     * Python FUSE (http://pypi.python.org/pypi/fuse-python/)
     * Python SQLite (http://docs.python.org/library/sqlite3.html)
-    * SQLAlchemy 5.8 or higher (http://www.sqlalchemy.org/)
+    * SQLAlchemy 0.5.8 or higher (http://www.sqlalchemy.org/)
 
 
 3. Installation
