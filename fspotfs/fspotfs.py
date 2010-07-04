@@ -508,7 +508,7 @@ def run():
         param_error('File "%s" not found' % fspot_db, parser)
 
     # initializes database session
-    init_session('sqlite:///' + fspot_db, True)
+    init_session('sqlite:///' + fspot_db, opts.log)
 
     # check database schema compatibility
     try:
