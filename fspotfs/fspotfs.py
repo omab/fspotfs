@@ -102,7 +102,7 @@ class FSpotFS(fuse.Fuse):
     """F-Spot FUSE filesystem implementation. Just readonly support
     at the moment"""
     def __init__(self, db_path, repeated, *args, **kwargs):
-        self.tags, self.reverse_tags, self.creation_pool  = {}, {}, {}
+        self.tags, self.reverse_tags = {}, {}
         self.db_path = db_path
         self.repeated = repeated
         self.load_tags()
@@ -201,10 +201,7 @@ class FSpotFS(fuse.Fuse):
             tag_id = self.tag_to_id(tag)
             if self.quote_name(fname) in self.file_names(tag_id):
                 return ImageLinkStat(self.real_path(tag_id, fname))
-        elif not DISABLE_IMPORT and path in self.creation_pool:
-            return NewFileState()
-        else:
-            return None
+        return None
 
     def readlink(self, path):
         """Readlink handler."""
@@ -297,12 +294,60 @@ class FSpotFS(fuse.Fuse):
         else: # original tag does not exist
             return -errno.ENOENT
 
+    def chmod(self, path, *args, **kwargs):
+        """Chmod support (called when moving images)"""
+        return 0
+
+    def chmown(self, path, *args, **kwargs):
+        """Chown support (called when moving images)"""
+        return 0
+
+    def symlink(self, source, target):
+        """Linking or symbolic link copying handler.
+
+        @source: is path to image
+        @target: is path in virtual filesystem
+
+        Linking from outside is not supported.
+        """
+        name = basename(source)
+        photo = Photo.filter(filename=name).first()
+        if photo is not None:
+            tag_id = self.tag_to_id(basename(dirname(target)))
+            pt = PhotoTag.filter(tag_id=tag_id, photo_id=photo.id).first()
+            if pt is None:
+                PhotoTag(tag_id=tag_id, photo_id=photo.id).add()
+            return 0
+        else:
+            return -errno.ENOSYS
+
+    def base_uri(self, path):
+        """Builds baseuri for path.
+
+        Path needs to be absolute or will be converted.
+        """
+        if not path.startswith('/'):
+            path = '/' + path
+        if not path.endswith('/'):
+            path = path + '/'
+        return 'file://' + path
+
+
+class FSpotFSWrite(FSpotFS):
+    """FSpotFS with write support (alows adding new images to collection)"""
+    def __init__(self, *args, **kwargs):
+        self.creation_pool = {}
+        super(FSpotFSWrite, self).__init__(*args, **kwargs)
+
+    def _getattr(self, path):
+        """Hierarchy stats builder, will return None if path is invalid."""
+        result = super(FSpotFSWrite, self)._getattr(path)
+        if result is None and path in self.creation_pool:
+            result = NewFileState()
+        return result
 
     def create(self, path, flags, mode):
         """Create file handler."""
-        if DISABLE_IMPORT: # no support if import is disabled
-            return -errno.ENOSYS
-
         if path not in self.creation_pool:
             # Register path in our creation pool, this way avoid
             # failures to OS on getattr
@@ -311,11 +356,9 @@ class FSpotFS(fuse.Fuse):
 
     def write(self, path, buff, offs, data=None):
         """Write file handler."""
-        if DISABLE_IMPORT: # no support if import is disabled
-            return -errno.ENOSYS
         if path not in self.creation_pool: # file was not created
             return -errno.ENOENT
-        photo = (data or self.creation_pool[path])
+        photo = data or self.creation_pool[path]
         return photo.write(buff, offs)
 
     def flush(self, path, data):
@@ -328,12 +371,10 @@ class FSpotFS(fuse.Fuse):
         Will move temporary written file to collection structure and tag
         properly.
         """
-        if DISABLE_IMPORT: # no support if import is disabled
-            return -errno.ENOSYS
         if path not in self.creation_pool: # file was not created
             return -errno.ENOENT
 
-        file = self.creation_pool.pop(path, None) or data
+        file = data or self.creation_pool.pop(path, None)
         if not file:
             return -errno.EINVAL
 
@@ -381,6 +422,7 @@ class FSpotFS(fuse.Fuse):
             photo = Photo(id=None, time=int(time.time()), base_uri=base_uri,
                           default_version_id=1, filename=name)
             photo.add()
+            # TODO: 'Original' string has i18n ?
             pv = PhotoVersion(photo_id=photo.id, version_id=1, name='Original',
                               filename=photo.filename, base_uri=photo.base_uri)
             pv.add()
@@ -394,43 +436,6 @@ class FSpotFS(fuse.Fuse):
         file.clean()
         return 0
 
-    def chmod(self, path, *args, **kwargs):
-        """Chmod support (called when moving images)"""
-        return 0
-
-    def chmown(self, path, *args, **kwargs):
-        """Chown support (called when moving images)"""
-        return 0
-
-    def symlink(self, source, target):
-        """Linking or symbolic link copying handler.
-
-        @source: is path to image
-        @target: is path in virtual filesystem
-
-        Linking from outside is not supported.
-        """
-        name = basename(source)
-        photo = Photo.filter(filename=name).first()
-        if photo is not None:
-            tag_id = self.tag_to_id(basename(dirname(target)))
-            pt = PhotoTag.filter(tag_id=tag_id, photo_id=photo.id).first()
-            if pt is None:
-                PhotoTag(tag_id=tag_id, photo_id=photo.id).add()
-            return 0
-        else:
-            return -errno.ENOSYS
-
-    def base_uri(self, path):
-        """Builds baseuri for path.
-
-        Path needs to be absolute or will be converted.
-        """
-        if not path.startswith('/'):
-            path = '/' + path
-        if not path.endswith('/'):
-            path = path + '/'
-        return 'file://' + path
 
 class PhotoFile(object):
     """New Photo file object"""
@@ -531,8 +536,10 @@ def run():
     args.mountpoint = mountpoint
     if opts.log:
         args.add('debug')
-    FSpotFS(fspot_db, opts.repeated, fuse_args=args).main() # run server
 
+    # run server
+    Klass = FSpotFS if DISABLE_IMPORT else FSpotFSWrite
+    Klass(fspot_db, opts.repeated, fuse_args=args).main()
 
 if __name__ == '__main__':
     run()
